@@ -1,0 +1,959 @@
+#pragma region VEXcode Generated Robot Configuration
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <math.h>
+#include <string.h>
+
+
+#include "vex.h"
+
+using namespace vex;
+
+brain Brain;
+
+
+// START V5 MACROS
+#define waitUntil(condition)                                                   \
+  do {                                                                         \
+    wait(5, msec);                                                             \
+  } while (!(condition))
+
+#define repeat(iterations)                                                     \
+  for (int iterator = 0; iterator < iterations; iterator++)
+// END V5 MACROS
+
+
+// Robot configuration code.
+controller Controller1 = controller(primary);
+motor ConveyorMotorA = motor(PORT2, ratio18_1, true);
+motor ConveyorMotorB = motor(PORT12, ratio18_1, false);
+motor_group Conveyor = motor_group(ConveyorMotorA, ConveyorMotorB);
+
+motor SlidesMotorA = motor(PORT4, ratio18_1, true);
+motor SlidesMotorB = motor(PORT5, ratio18_1, false);
+motor_group Slides = motor_group(SlidesMotorA, SlidesMotorB);
+
+motor IntakesMotorA = motor(PORT3, ratio18_1, false);
+motor IntakesMotorB = motor(PORT6, ratio18_1, true);
+motor_group Intakes = motor_group(IntakesMotorA, IntakesMotorB);
+
+motor leftMotorA = motor(PORT8, ratio18_1, false);
+motor leftMotorB = motor(PORT9, ratio18_1, false);
+motor_group LeftDriveSmart = motor_group(leftMotorA, leftMotorB);
+motor rightMotorA = motor(PORT7, ratio18_1, true);
+motor rightMotorB = motor(PORT10, ratio18_1, true);
+motor_group RightDriveSmart = motor_group(rightMotorA, rightMotorB);
+inertial DrivetrainInertial = inertial(PORT11);
+smartdrive Drivetrain = smartdrive(LeftDriveSmart, RightDriveSmart, DrivetrainInertial, 200, 320, 40, mm, 1);
+
+inertial DrivetrainInertial2 = inertial(PORT1);
+
+bumper BumperA = bumper(Brain.ThreeWirePort.A);
+
+
+// generating and setting random seed
+void initializeRandomSeed(){
+  int systemTime = Brain.Timer.systemHighResolution();
+  double batteryCurrent = Brain.Battery.current();
+  double batteryVoltage = Brain.Battery.voltage(voltageUnits::mV);
+
+  // Combine these values into a single integer
+  int seed = int(batteryVoltage + batteryCurrent * 100) + systemTime;
+
+  // Set the seed
+  srand(seed);
+}
+
+bool vexcode_initial_drivetrain_calibration_completed = false;
+void calibrateDrivetrain() {
+  wait(200, msec);
+  Brain.Screen.print("Calibrating");
+  Brain.Screen.newLine();
+  Brain.Screen.print("Inertial");
+  DrivetrainInertial.calibrate();
+  while (DrivetrainInertial.isCalibrating()) {
+    wait(25, msec);
+  }
+  vexcode_initial_drivetrain_calibration_completed = true;
+  Brain.Screen.clearScreen();
+  Brain.Screen.setCursor(1, 1);
+}
+
+void vexcodeInit() {
+
+  // Calibrate the Drivetrain
+  calibrateDrivetrain();
+
+  //Initializing random seed.
+  initializeRandomSeed(); 
+}
+
+
+// Helper to make playing sounds from the V5 in VEXcode easier and
+// keeps the code cleaner by making it clear what is happening.
+void playVexcodeSound(const char *soundName) {
+  printf("VEXPlaySound:%s\n", soundName);
+  wait(5, msec);
+}
+
+
+
+// define variable for remote controller enable/disable
+bool RemoteControlCodeEnabled = true;
+
+#pragma endregion VEXcode Generated Robot Configuration
+#include "vex.h"
+using namespace vex;
+
+float myVariable, drive_error, drive_sensor, drive_derivative, drive_output;
+
+
+// TUNING SYSTEM
+
+#define NUM_SEGMENTS 15
+
+#define SD_FILENAME "segdist.txt"
+
+// Tunable distances (inches). Defaults, overwritten by SD card on startup
+float segDist[NUM_SEGMENTS] = {
+  5.0,   // Seg 1 : forward
+  39.0,  // Seg 2 : forward
+  6.0,   // Seg 3 : forward
+  58.0,  // Seg 4 : forward
+  30.0,  // Seg 5 : forward
+  21.0,  // Seg 6 : forward
+  12.0,  // Seg 7 : forward
+  41.0,  // Seg 8 : reverse
+  13.0,  // Seg 9 : forward
+  3.0,   // Seg 10: reverse
+  16.0,  // Seg 11: forward
+  5.0,   // Seg 12: reverse
+  33.0,  // Seg 13: forward
+  3.0,   // Seg 14: forward
+  5.0    // Seg 15: forward
+};
+
+// Directions for each segment (for display only)
+const char* segDir[NUM_SEGMENTS] = {
+  "FWD", "FWD", "FWD", "FWD", "FWD", "FWD", "FWD",
+  "REV", "FWD", "REV", "FWD", "REV", "FWD", "FWD", "FWD"
+};
+
+// Step sizes available via R1/R2: 0.5, 2.0, 5.0 inches
+float stepSizes[3] = {0.5, 2.0, 5.0};
+int stepIndex = 0;   // which step size is active
+int currentSeg = 0;  // which segment is selected in the tuning UI
+int slideDist = 550;
+float seg6TurnDeg = 90.0f; // tunable turn angle for segment 6 (degrees)
+float distDiff1 = 8.0f;   // extra offset for fan position 1 (inches, tunable)
+float distDiff3 = 8.0f;   // extra offset for fan position 3 (inches, tunable)
+int   fanPos    = 2;       // selected fan position: 1, 2, or 3
+
+
+bool stopAfterSeg = false;
+
+// Polls Y during the trailing actions of a segment (turns, spins, waits).
+// Sample continuously
+bool yWasPressed = false; // debounce state across polling calls
+
+void resetYStop() {
+  stopAfterSeg = false;
+  yWasPressed  = Controller1.ButtonY.pressing(); // absorb any held press
+}
+
+// so the tuning loop knows where to restart.
+void checkYStop(int segIndex) {
+  bool yNow = Controller1.ButtonY.pressing();
+  if (yNow && !yWasPressed) {
+    stopAfterSeg = true;
+    currentSeg   = segIndex;
+  }
+  yWasPressed = yNow;
+}
+
+
+// SD CARD: load & save
+void loadDistances() {
+  if (!Brain.SDcard.isInserted()) return;
+
+  FILE* f = fopen(SD_FILENAME, "r");
+  if (f == nullptr) return;
+
+  for (int i = 0; i < NUM_SEGMENTS; i++) {
+    float val = 0.0f;
+    if (fscanf(f, "%f", &val) == 1 && val >= 0.1f) {
+      segDist[i] = val;
+    }
+  }
+  // Load seg6 turn degrees, keep default if missing or invalid
+  float turnVal = 0.0f;
+  if (fscanf(f, "%f", &turnVal) == 1 && turnVal >= 1.0f) {
+    seg6TurnDeg = turnVal;
+  }
+  // Load distDiff1 (line 17) and distDiff3 (line 18)
+  float dd1 = 0.0f, dd3 = 0.0f;
+  if (fscanf(f, "%f", &dd1) == 1 && dd1 >= 0.1f) distDiff1 = dd1;
+  if (fscanf(f, "%f", &dd3) == 1 && dd3 >= 0.1f) distDiff3 = dd3;
+  fclose(f);
+}
+
+void saveDistances() {
+  Controller1.Screen.clearScreen();
+  Controller1.Screen.setCursor(1, 1);
+
+  if (!Brain.SDcard.isInserted()) {
+    Controller1.Screen.print("No SD card!");
+    wait(1200, msec);
+    return;
+  }
+
+  FILE* f = fopen(SD_FILENAME, "w");
+  if (f == nullptr) {
+    Controller1.Screen.print("Save failed!");
+    wait(1200, msec);
+    return;
+  }
+
+  for (int i = 0; i < NUM_SEGMENTS; i++) {
+    fprintf(f, "%.2f\n", segDist[i]);
+  }
+  // Save seg6 turn degrees as line 16
+  fprintf(f, "%.2f\n", seg6TurnDeg);
+  // Save distDiff1 and distDiff3
+  fprintf(f, "%.2f\n", distDiff1);
+  fprintf(f, "%.2f\n", distDiff3);
+  fclose(f);
+
+  Controller1.Screen.print("Saved to SD!");
+  wait(1000, msec);
+}
+
+// Controller display update 
+void updateControllerDisplay() {
+  Controller1.Screen.clearScreen();
+  Controller1.Screen.setCursor(1, 1);
+  Controller1.Screen.print("Seg %d/%d  %s", currentSeg + 1, NUM_SEGMENTS, segDir[currentSeg]);
+  Controller1.Screen.setCursor(2, 1);
+  Controller1.Screen.print("Dist: %.1f in", segDist[currentSeg]);
+  Controller1.Screen.setCursor(3, 1);
+  if (currentSeg == 5) {
+    // Seg 6: R1/R2 adjust the turn angle
+    Controller1.Screen.print("Turn: %.0f deg", seg6TurnDeg);
+  } else if (currentSeg == 7 && fanPos == 1) {
+    // Seg 8, position 1: R1/R2 adjust distDiff1
+    Controller1.Screen.print("Diff1: %.1f in", distDiff1);
+  } else if (currentSeg == 7 && fanPos == 3) {
+    // Seg 8, position 3: R1/R2 adjust distDiff3
+    Controller1.Screen.print("Diff3: %.1f in", distDiff3);
+  } else {
+    Controller1.Screen.print("Step: %.1f in", stepSizes[stepIndex]);
+  }
+}
+
+// AUTONOMOUS ROUTINE: fall-through from startSeg to end
+
+void runFromSegment(int startSeg) {
+  Intakes.setVelocity(15.0, percent);
+  Conveyor.setVelocity(40.0, percent);
+  Slides.setVelocity(20.0, percent);
+  Conveyor.setPosition(0.0, degrees);
+  Slides.setPosition(0.0, degrees);
+  Intakes.setPosition(0.0, degrees);
+  Slides.setTimeout(7.0, sec);
+  Drivetrain.setDriveVelocity(50.0, percent);
+  resetYStop();
+
+  switch (startSeg) {
+    case 0:
+    // Segment 1
+    Drivetrain.driveFor(forward, segDist[0], inches, true);
+    Drivetrain.turnFor(left, 90.0, degrees, true);
+    checkYStop(0); if (stopAfterSeg) return;
+
+    case 1:
+    // Segment 2
+    Drivetrain.driveFor(forward, segDist[1], inches, true);
+    Drivetrain.turnFor(left, 90.0, degrees, true);
+    checkYStop(1); if (stopAfterSeg) return;
+
+    case 2:
+{
+  Drivetrain.driveFor(forward, segDist[2], inches, false);
+  double start = Brain.Timer.time(msec);
+  bool nudgeDone = false;
+  Intakes.spin(forward);
+  while (!BumperA.pressing()) {
+    if (!nudgeDone && (Brain.Timer.time(msec) - start) >= 2000) {
+      Drivetrain.driveFor(forward, 1, inches, false);
+      nudgeDone = true;
+    }
+    if ((Brain.Timer.time(msec) - start) >= 5000) {
+      break;
+    }
+  }
+  Intakes.stop();
+  Slides.spinFor(forward, slideDist, degrees, true);
+  Intakes.spinFor(forward, 2.0, turns, false);
+  Conveyor.spinFor(forward, 6.0, turns, false);
+  wait(1.0, seconds);
+  Drivetrain.turnFor(right, 180.0, degrees, true);
+  checkYStop(2); if (stopAfterSeg) return;
+}
+
+    case 3:
+    // Segment 4 
+    // drive though main hallway to the auton zone and turn into auton zone
+    Drivetrain.driveFor(forward, segDist[3], inches, true);
+    Drivetrain.turnFor(right, 90.0, degrees, true);
+    checkYStop(3); if (stopAfterSeg) return;
+
+    case 4:
+    // Segment 5
+    // drive into auton zone and make first turn in auton
+    Drivetrain.driveFor(forward, segDist[4], inches, true);
+    Intakes.spinToPosition(0.0, degrees, false);
+    Drivetrain.turnFor(right, 90.0, degrees, true);
+    checkYStop(4); if (stopAfterSeg) return;
+
+    case 5:
+    // Segment 6
+    // move into main auton zone and turn to the 2nd supply
+    Drivetrain.driveFor(forward, segDist[5], inches, true);
+    Drivetrain.turnFor(right, seg6TurnDeg, degrees, true);
+    Slides.spinFor(reverse, slideDist, degrees, true);
+    //Intakes.spinFor(forward, 2.0, turns, false);
+    checkYStop(5); if (stopAfterSeg) return;
+
+    case 6:
+    // Segment 7
+    // intake 2nd supply
+    {
+  Drivetrain.driveFor(forward, segDist[6], inches, false);
+  double start = Brain.Timer.time(msec);
+  bool nudgeDone = false;
+  Intakes.spin(forward);
+  while (!BumperA.pressing()) {
+    if (!nudgeDone && (Brain.Timer.time(msec) - start) >= 5000) {
+      Drivetrain.driveFor(forward, 2, inches, false);
+      nudgeDone = true;
+    }
+    if ((Brain.Timer.time(msec) - start) >= 8000) {
+      break;
+    }
+  }
+
+  Intakes.stop();
+  Slides.spinFor(forward, slideDist, degrees, true);
+  Intakes.spinFor(forward, 2.0, turns, false);
+  Conveyor.spinFor(forward, 6.0, turns, false);
+  Drivetrain.turnToRotation(270, degrees, true);
+    checkYStop(6); if (stopAfterSeg) return;
+    }
+
+    case 7:
+    // Segment 8
+    // reverse up to fan and turn to it
+    {
+      float seg8Rev = segDist[7];
+      if      (fanPos == 1) seg8Rev -= distDiff1;
+      else if (fanPos == 3) seg8Rev += distDiff3;
+      Drivetrain.driveFor(reverse, seg8Rev, inches, true);
+    }
+    Slides.spinFor(reverse, slideDist, degrees, true);
+    Drivetrain.turnFor(right, 90.0, degrees, true);
+    //Intakes.spinFor(forward, 1.0, turns, false);
+    checkYStop(7); if (stopAfterSeg) return;
+
+    case 8:
+    // Segment 9
+    // intake fan
+   {
+  Drivetrain.driveFor(forward, segDist[8], inches, true);
+  double start = Brain.Timer.time(msec);
+  bool nudgeDone = false;
+  Intakes.spin(forward);
+  while (!BumperA.pressing()) {
+    if (!nudgeDone && (Brain.Timer.time(msec) - start) >= 2000) {
+      Drivetrain.driveFor(forward, 1, inches, false);
+      nudgeDone = true;
+    }
+    if ((Brain.Timer.time(msec) - start) >= 5000) {
+      break;
+    }
+  }
+    Intakes.stop();
+    Slides.spinFor(forward, 12.0, turns, true);
+    checkYStop(8); if (stopAfterSeg) return;
+   }
+
+    case 9:
+    // Segment 10
+    // reverse into platform/turn around
+    Drivetrain.setDriveVelocity(25, percent);
+    Drivetrain.setTurnVelocity(25, percent);
+    if (fanPos == 2) {
+      // Default: reverse then 180
+      Drivetrain.driveFor(reverse, segDist[9], inches, true);
+      Drivetrain.turnFor(right, 180.0, degrees, true);
+    } else if (fanPos == 1) {
+      // Position 1: turn 90 right, then drive forward by distDiff1
+      Drivetrain.driveFor(reverse, segDist[9], inches, true);
+      Drivetrain.turnFor(right, 90.0, degrees, true);
+      Drivetrain.driveFor(forward, distDiff1, inches, true);
+      Drivetrain.turnFor(right, 90.0, degrees, true);
+    } else if (fanPos == 3) {
+      // Position 3: turn 90 right, then reverse by distDiff3
+      Drivetrain.driveFor(reverse, segDist[9], inches, true);
+      Drivetrain.turnFor(right, 90.0, degrees, true);
+      Drivetrain.driveFor(reverse, distDiff3, inches, true);
+      Drivetrain.turnFor(right, 90.0, degrees, true);
+    }
+    checkYStop(9); if (stopAfterSeg) return;
+
+    case 10:
+    // Segment 11
+    // outtake fan
+    Drivetrain.driveFor(forward, segDist[10], inches, true);
+    Intakes.spinFor(reverse, 360.0, degrees, true);
+    checkYStop(10); if (stopAfterSeg) return;
+
+    case 11:
+    // Segment 12
+    // reverse away after outtake
+    Drivetrain.driveFor(reverse, segDist[11], inches, true);
+    Drivetrain.turnFor(left, 90, degrees, true);
+    Slides.spinFor(reverse, 12.0, turns, true);
+    checkYStop(11); if (stopAfterSeg) return;
+
+    case 12:
+    // Segment 13
+    // go to the 3rd supply
+    Drivetrain.driveFor(forward, segDist[12], inches, true);
+    Intakes.stop();
+    checkYStop(12); if (stopAfterSeg) return;
+
+    case 13:
+    // Segment 14
+    // intake 3rd supply
+    {
+    Drivetrain.driveFor(forward, segDist[13], inches, false);
+
+    double start = Brain.Timer.time(msec);
+    bool nudgeDone = false;
+    Intakes.spin(forward);
+    while (!BumperA.pressing()) {
+      if (!nudgeDone && (Brain.Timer.time(msec) - start) >= 2000) {
+        Drivetrain.driveFor(forward, 1, inches, false);
+        nudgeDone = true;
+      }
+      if ((Brain.Timer.time(msec) - start) >= 5000) {
+        break;
+      }
+    }
+
+    Intakes.stop();
+    Drivetrain.turnFor(left, 90.0, degrees, true);
+    checkYStop(13); if (stopAfterSeg) return;
+    }
+    case 14:
+    // Segment 15
+    Drivetrain.driveFor(forward, segDist[14], inches, true);
+    Conveyor.spinFor(forward, 400.0, degrees, true);
+    Intakes.spinFor(reverse, 8.0, turns, false);
+    Conveyor.spinFor(reverse, 14.0, turns, true);
+    checkYStop(14); 
+    // last segment
+
+    default:
+    break;
+  }
+}
+
+// runOnlySegment: executes exactly one segment then stops
+void runOnlySegment(int seg) {
+  Intakes.setVelocity(15.0, percent);
+  Conveyor.setVelocity(40.0, percent);
+  Slides.setVelocity(20.0, percent);
+  Conveyor.setPosition(0.0, degrees);
+  Slides.setPosition(0.0, degrees);
+  Intakes.setPosition(0.0, degrees);
+  Slides.setTimeout(4.0, sec);
+  Drivetrain.setDriveVelocity(50.0, percent);
+  resetYStop();
+
+  switch (seg) {
+    case 0:
+    // Segment 1
+    Drivetrain.driveFor(forward, segDist[0], inches, true);
+    Drivetrain.turnFor(left, 90.0, degrees, true);
+    checkYStop(0); if (stopAfterSeg) return;
+
+    case 1:
+    // Segment 2
+    Drivetrain.driveFor(forward, segDist[1], inches, true);
+    Drivetrain.turnFor(left, 90.0, degrees, true);
+    checkYStop(1); if (stopAfterSeg) return;
+
+    case 2:
+{
+  Drivetrain.driveFor(forward, segDist[2], inches, false);
+  double start = Brain.Timer.time(msec);
+  bool nudgeDone = false;
+  Intakes.spin(forward);
+  while (!BumperA.pressing()) {
+    if (!nudgeDone && (Brain.Timer.time(msec) - start) >= 2000) {
+      Drivetrain.driveFor(forward, 1, inches, false);
+      nudgeDone = true;
+    }
+    if ((Brain.Timer.time(msec) - start) >= 5000) {
+      break;
+    }
+  }
+  Intakes.stop();
+  Slides.spinFor(forward, slideDist, degrees, true);
+  Intakes.spinFor(forward, 2.0, turns, false);
+  Conveyor.spinFor(forward, 6.0, turns, false);
+  wait(1.0, seconds);
+  Drivetrain.turnFor(right, 180.0, degrees, true);
+  checkYStop(2); if (stopAfterSeg) return;
+}
+
+    case 3:
+    // Segment 4
+    // drive though main hallway to the auton zone and turn into auton zone
+    Drivetrain.driveFor(forward, segDist[3], inches, true);
+    Drivetrain.turnFor(right, 90.0, degrees, true);
+    checkYStop(3); if (stopAfterSeg) return;
+
+    case 4:
+    // Segment 5
+    // drive into auton zone and make first turn in auton
+    Drivetrain.driveFor(forward, segDist[4], inches, true);
+    Intakes.spinToPosition(0.0, degrees, false);
+    Drivetrain.turnFor(right, 90.0, degrees, true);
+    checkYStop(4); if (stopAfterSeg) return;
+
+    case 5:
+    // Segment 6
+    // move into main auton zone and turn to the 2nd supply
+    Drivetrain.driveFor(forward, segDist[5], inches, true);
+    Drivetrain.turnFor(right, seg6TurnDeg, degrees, true);
+    Slides.spinFor(reverse, slideDist, degrees, true);
+    //Intakes.spinFor(forward, 2.0, turns, false);
+    checkYStop(5); if (stopAfterSeg) return;
+
+    case 6:
+    // Segment 7
+    // intake 2nd supply
+    {
+  Drivetrain.driveFor(forward, segDist[6], inches, true);
+  double start = Brain.Timer.time(msec);
+  bool nudgeDone = false;
+  Intakes.spin(forward);
+  while (!BumperA.pressing()) {
+    if (!nudgeDone && (Brain.Timer.time(msec) - start) >= 2000) {
+      Drivetrain.driveFor(forward, 1, inches, false);
+      nudgeDone = true;
+    }
+    if ((Brain.Timer.time(msec) - start) >= 5000) {
+      break;
+    }
+  }
+  Intakes.stop();
+  Slides.spinFor(forward, slideDist, degrees, true);
+  Intakes.spinFor(forward, 2.0, turns, false);
+  Conveyor.spinFor(forward, 6.0, turns, false);
+  Drivetrain.turnToRotation(270, degrees, true);
+    checkYStop(6); if (stopAfterSeg) return;
+    }
+
+    case 7:
+    // Segment 8
+    // reverse up to fan and turn to it
+    {
+      float seg8Rev = segDist[7];
+      if      (fanPos == 1) seg8Rev -= distDiff1;
+      else if (fanPos == 3) seg8Rev += distDiff3;
+      Drivetrain.driveFor(reverse, seg8Rev, inches, true);
+    }
+    Slides.spinFor(reverse, slideDist, degrees, true);
+    Drivetrain.turnFor(right, 90.0, degrees, true);
+    //Intakes.spinFor(forward, 1.0, turns, false);
+    checkYStop(7); if (stopAfterSeg) return;
+
+    case 8:
+    // Segment 9
+    // intake fan
+   {
+  Drivetrain.driveFor(forward, segDist[8], inches, true);
+  double start = Brain.Timer.time(msec);
+  bool nudgeDone = false;
+  Intakes.spin(forward);
+  while (!BumperA.pressing()) {
+    if (!nudgeDone && (Brain.Timer.time(msec) - start) >= 2000) {
+      Drivetrain.driveFor(forward, 1, inches, false);
+      nudgeDone = true;
+    }
+    if ((Brain.Timer.time(msec) - start) >= 5000) {
+      break;
+    }
+  }
+    Intakes.stop();
+    //Intakes.spinFor(reverse, 20.0, degrees, true);
+    Slides.spinFor(forward, 12, turns, true);
+    checkYStop(8); if (stopAfterSeg) return;
+   }
+
+    case 9:
+    // Segment 10
+    // reverse into platform/turn around
+    Drivetrain.setDriveVelocity(30, percent);
+    Drivetrain.setTurnVelocity(30, percent);
+    if (fanPos == 2) {
+      // Default: reverse then 180
+      Drivetrain.driveFor(reverse, segDist[9], inches, true);
+      Drivetrain.turnFor(right, 180.0, degrees, true);
+    } else if (fanPos == 1) {
+      // Position 1: turn 90 right, then drive forward by distDiff1
+      Drivetrain.turnFor(right, 90.0, degrees, true);
+      Drivetrain.driveFor(forward, distDiff1, inches, true);
+    } else if (fanPos == 3) {
+      // Position 3: turn 90 right, then reverse by distDiff3
+      Drivetrain.turnFor(right, 90.0, degrees, true);
+      Drivetrain.driveFor(reverse, distDiff3, inches, true);
+    }
+    checkYStop(9); if (stopAfterSeg) return;
+
+    case 10:
+    // Segment 11
+    // outtake fan
+    Drivetrain.driveFor(forward, segDist[10], inches, true);
+    Intakes.spinFor(reverse, 360.0, degrees, true);
+    checkYStop(10); if (stopAfterSeg) return;
+
+    case 11:
+    // Segment 12
+    // reverse away after outtake
+    Drivetrain.driveFor(reverse, segDist[11], inches, true);
+    Drivetrain.turnFor(left, 90, degrees, true);
+    Slides.spinFor(reverse, 12.0, turns, true);
+    checkYStop(11); if (stopAfterSeg) return;
+
+    case 12:
+    // Segment 13
+    // go to the 3rd supply
+    Drivetrain.driveFor(forward, segDist[12], inches, true);
+    Intakes.stop();
+    checkYStop(12); if (stopAfterSeg) return;
+
+    case 13:
+    // Segment 14
+    // intake 3rd supply
+    {
+    Drivetrain.driveFor(forward, segDist[13], inches, false);
+
+    double start = Brain.Timer.time(msec);
+    bool nudgeDone = false;
+    Intakes.spin(forward);
+    while (!BumperA.pressing()) {
+      if (!nudgeDone && (Brain.Timer.time(msec) - start) >= 2000) {
+        Drivetrain.driveFor(forward, 1, inches, false);
+        nudgeDone = true;
+      }
+      if ((Brain.Timer.time(msec) - start) >= 5000) {
+        break;
+      }
+    }
+    Intakes.stop();
+    Drivetrain.turnFor(left, 90.0, degrees, true);
+    checkYStop(13); if (stopAfterSeg) return;
+    }
+    case 14:
+    // Segment 15
+    Drivetrain.driveFor(forward, segDist[14], inches, true);
+    Slides.spinToPosition(slideDist, degrees, true);
+    Intakes.spinToPosition (60, degrees, true);
+    Conveyor.spinFor(forward, 6.7, turns, true);
+    Intakes.spinFor(reverse, 30, degrees, true);
+    Intakes.spinToPosition(60, degrees, true);
+    Conveyor.spinFor(reverse, 400, degrees, true);
+    Intakes.spinFor(reverse, 30, degrees);
+    checkYStop(14);
+    // last segmen
+
+    default:
+    break;
+  }
+}
+
+// Tuning loop:
+/*
+ Controls:
+   UP = advance to next segment (wraps around)
+   X = increase current segment distance by step
+   B = decrease current segment distance by step (min 0.1 in)
+   R1 = increase step size (0.5, 2.0, 5.0 in)
+   R2 = decrease step size (5.0, 2.0, 0.5 in)
+   L1 = save all distances to SD card
+   L2 = run only the currently selected segment
+   Y = stop at the end of the current segment
+   DOWN = run full autonomous from segment 1
+   RIGHT = run autonomous starting from the currently selected segment */
+void tuningLoop() {
+  // Fan position selection on Brain screen
+  // Display 3 large coloured buttons
+  // Defaults to position 2.
+  {
+    bool selected = false;
+    while (!selected) {
+      Brain.Screen.clearScreen();
+
+      // Button 1 (red)
+      Brain.Screen.setFillColor(color(180, 30, 30));
+      Brain.Screen.drawRectangle(10, 20, 130, 180);
+      Brain.Screen.setFillColor(color(220, 60, 60));
+      Brain.Screen.drawRectangle(12, 22, 126, 176);
+      Brain.Screen.setFillColor(color(180, 30, 30));
+      Brain.Screen.setPenColor(white);
+      Brain.Screen.setFont(fontType::mono40);
+      Brain.Screen.setCursor(3, 2);
+      Brain.Screen.print("1");
+
+      // Button 2 (green)
+      Brain.Screen.setFillColor(color(30, 130, 30));
+      Brain.Screen.drawRectangle(165, 20, 130, 180);
+      Brain.Screen.setFillColor(color(60, 200, 60));
+      Brain.Screen.drawRectangle(167, 22, 126, 176);
+      Brain.Screen.setFillColor(color(30, 130, 30));
+      Brain.Screen.setPenColor(white);
+      Brain.Screen.setFont(fontType::mono40);
+      Brain.Screen.setCursor(3, 12);
+      Brain.Screen.print("2");
+
+      // Button 3 (blue)
+      Brain.Screen.setFillColor(color(30, 30, 180));
+      Brain.Screen.drawRectangle(320, 20, 130, 180);
+      Brain.Screen.setFillColor(color(60, 60, 220));
+      Brain.Screen.drawRectangle(322, 22, 126, 176);
+      Brain.Screen.setFillColor(color(30, 30, 180));
+      Brain.Screen.setPenColor(white);
+      Brain.Screen.setFont(fontType::mono40);
+      Brain.Screen.setCursor(3, 22);
+      Brain.Screen.print("3");
+
+      // Label row at bottom
+      Brain.Screen.setFont(fontType::mono15);
+      Brain.Screen.setPenColor(white);
+      Brain.Screen.setFillColor(black);
+      Brain.Screen.setCursor(10, 3);
+      Brain.Screen.print("Fan Position 1   Fan Position 2   Fan Position 3");
+
+      wait(20, msec);
+
+      if (Brain.Screen.pressing()) {
+        int tx = Brain.Screen.xPosition();
+        int ty = Brain.Screen.yPosition();
+        if (tx >= 10 && tx <= 140 && ty >= 20 && ty <= 200) {
+          fanPos   = 1;
+          selected = true;
+          Brain.Screen.clearScreen();
+          Brain.Screen.setFillColor(color(180, 30, 30));
+          Brain.Screen.drawRectangle(0, 0, 480, 240);
+          Brain.Screen.setPenColor(white);
+          Brain.Screen.setFont(fontType::mono40);
+          Brain.Screen.setCursor(4, 8);
+          Brain.Screen.print("Position 1");
+          wait(600, msec);
+        } else if (tx >= 165 && tx <= 295 && ty >= 20 && ty <= 200) {
+          fanPos   = 2;
+          selected = true;
+          Brain.Screen.clearScreen();
+          Brain.Screen.setFillColor(color(30, 130, 30));
+          Brain.Screen.drawRectangle(0, 0, 480, 240);
+          Brain.Screen.setPenColor(white);
+          Brain.Screen.setFont(fontType::mono40);
+          Brain.Screen.setCursor(4, 8);
+          Brain.Screen.print("Position 2");
+          wait(600, msec);
+        } else if (tx >= 320 && tx <= 450 && ty >= 20 && ty <= 200) {
+          fanPos   = 3;
+          selected = true;
+          Brain.Screen.clearScreen();
+          Brain.Screen.setFillColor(color(30, 30, 180));
+          Brain.Screen.drawRectangle(0, 0, 480, 240);
+          Brain.Screen.setPenColor(white);
+          Brain.Screen.setFont(fontType::mono40);
+          Brain.Screen.setCursor(4, 8);
+          Brain.Screen.print("Position 3");
+          wait(600, msec);
+        }
+        // Wait for finger release before continuing
+        while (Brain.Screen.pressing()) wait(10, msec);
+      }
+    }
+    Brain.Screen.clearScreen();
+    Brain.Screen.setFont(fontType::mono15);
+    Brain.Screen.setPenColor(white);
+    Brain.Screen.setFillColor(black);
+  }
+  // End fan position selection
+
+  // Outer loop: run, tune, run, tune
+  while (true) {
+    updateControllerDisplay();
+
+    bool upWasPressed    = false;
+    bool xWasPressed     = false;
+    bool bWasPressed     = false;
+    bool r1WasPressed    = false;
+    bool r2WasPressed    = false;
+    bool l1WasPressed    = false;
+    bool l2WasPressed    = false;
+    bool downWasPressed  = false;
+    bool rightWasPressed = false;
+
+    // exitMode: 0=still in loop, 1=full auton, 2=from current seg, 3=only current seg
+    int exitMode = 0;
+
+    while (exitMode == 0) {
+      bool upNow = Controller1.ButtonUp.pressing();
+      if (upNow && !upWasPressed) {
+        currentSeg = (currentSeg + 1) % NUM_SEGMENTS;
+        updateControllerDisplay();
+      }
+      upWasPressed = upNow;
+
+      bool xNow = Controller1.ButtonX.pressing();
+      if (xNow && !xWasPressed) {
+        segDist[currentSeg] += stepSizes[stepIndex];
+        segDist[currentSeg] = roundf(segDist[currentSeg] * 10.0f) / 10.0f;
+        updateControllerDisplay();
+      }
+      xWasPressed = xNow;
+
+      bool bNow = Controller1.ButtonB.pressing();
+      if (bNow && !bWasPressed) {
+        segDist[currentSeg] -= stepSizes[stepIndex];
+        if (segDist[currentSeg] < 0.1f) segDist[currentSeg] = 0.1f;
+        segDist[currentSeg] = roundf(segDist[currentSeg] * 10.0f) / 10.0f;
+        updateControllerDisplay();
+      }
+      bWasPressed = bNow;
+
+      bool r1Now = Controller1.ButtonR1.pressing();
+      if (r1Now && !r1WasPressed) {
+        if (currentSeg == 5) {
+          seg6TurnDeg += 1.0f;
+        } else if (currentSeg == 7 && fanPos == 1) {
+          distDiff1 += 0.5f;
+          distDiff1 = roundf(distDiff1 * 10.0f) / 10.0f;
+        } else if (currentSeg == 7 && fanPos == 3) {
+          distDiff3 += 0.5f;
+          distDiff3 = roundf(distDiff3 * 10.0f) / 10.0f;
+        } else {
+          if (stepIndex < 2) stepIndex++;
+        }
+        updateControllerDisplay();
+      }
+      r1WasPressed = r1Now;
+
+      bool r2Now = Controller1.ButtonR2.pressing();
+      if (r2Now && !r2WasPressed) {
+        if (currentSeg == 5) {
+          if (seg6TurnDeg > 1.0f) seg6TurnDeg -= 1.0f;
+        } else if (currentSeg == 7 && fanPos == 1) {
+          if (distDiff1 > 0.5f) distDiff1 -= 0.5f;
+          distDiff1 = roundf(distDiff1 * 10.0f) / 10.0f;
+        } else if (currentSeg == 7 && fanPos == 3) {
+          if (distDiff3 > 0.5f) distDiff3 -= 0.5f;
+          distDiff3 = roundf(distDiff3 * 10.0f) / 10.0f;
+        } else {
+          if (stepIndex > 0) stepIndex--;
+        }
+        updateControllerDisplay();
+      }
+      r2WasPressed = r2Now;
+
+      bool l1Now = Controller1.ButtonL1.pressing();
+      if (l1Now && !l1WasPressed) {
+        saveDistances();
+        updateControllerDisplay();
+      }
+      l1WasPressed = l1Now;
+
+      bool l2Now = Controller1.ButtonL2.pressing();
+      if (l2Now && !l2WasPressed) {
+        exitMode = 3;
+      }
+      l2WasPressed = l2Now;
+
+      bool downNow = Controller1.ButtonDown.pressing();
+      if (downNow && !downWasPressed) {
+        exitMode = 1;
+      }
+      downWasPressed = downNow;
+
+      bool rightNow = Controller1.ButtonRight.pressing();
+      if (rightNow && !rightWasPressed) {
+        exitMode = 2;
+      }
+      rightWasPressed = rightNow;
+
+      wait(20, msec);
+    }
+
+    // Execute the chosen run
+    Controller1.Screen.clearScreen();
+    Controller1.Screen.setCursor(1, 1);
+
+    if (exitMode == 1) {
+      Controller1.Screen.print("Running Auton!");
+      runFromSegment(0);
+    } else if (exitMode == 2) {
+      Controller1.Screen.print("From Seg %d...", currentSeg + 1);
+      runFromSegment(currentSeg);
+    } else if (exitMode == 3) {
+      Controller1.Screen.print("Seg %d only...", currentSeg + 1);
+      runOnlySegment(currentSeg);
+    }
+
+    // Status message before looping back to the tuning UI.
+    Controller1.Screen.clearScreen();
+    Controller1.Screen.setCursor(1, 1);
+    if (stopAfterSeg) {
+      Controller1.Screen.print("Stopped@Seg%d", currentSeg + 1);
+    } else {
+      Controller1.Screen.print("Done! Tuning...");
+    }
+    wait(800, msec);
+    // Loop back to top, reinitialise debounce flags and redraw display.
+  }
+}
+// taking the average of 2 inertials to compensate for error
+int headingAveragerTask() {
+  while (true) {
+    float h1 = DrivetrainInertial.heading(degrees);
+    float h2 = DrivetrainInertial2.heading(degrees);
+
+    // Average with correct 0/360 wrap handling
+    float diff = h2 - h1;
+    while (diff >  180.0f) diff -= 360.0f;
+    while (diff <= -180.0f) diff += 360.0f;
+    float avg = h1 + diff * 0.5f;
+    if (avg <    0.0f) avg += 360.0f;
+    if (avg >= 360.0f) avg -= 360.0f;
+
+    Drivetrain.setHeading(avg, degrees);
+    wait(10, msec);
+  }
+  return 0;
+}
+
+
+int main() {
+  vexcodeInit();
+  vex::task headingTask = vex::task(headingAveragerTask);
+  loadDistances();
+  tuningLoop();
+}
