@@ -1,0 +1,647 @@
+#pragma region VEXcode Generated Robot Configuration
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <math.h>
+#include <string.h>
+#include "vex.h"
+
+using namespace vex;
+
+brain Brain;
+
+
+// START V5 MACROS
+#define waitUntil(condition)                                                   \
+  do {                                                                         \
+    wait(5, msec);                                                             \
+  } while (!(condition))
+
+#define repeat(iterations)                                                     \
+  for (int iterator = 0; iterator < iterations; iterator++)
+// END V5 MACROS
+
+
+// Robot configuration code.
+controller Controller1 = controller(primary);
+inertial inertial1 = inertial(PORT11);
+
+motor ConveyorMotorA = motor(PORT2, ratio18_1, false);
+motor ConveyorMotorB = motor(PORT12, ratio18_1, true);
+motor_group Conveyor = motor_group(ConveyorMotorA, ConveyorMotorB);
+
+motor SlidesMotorA = motor(PORT4, ratio18_1, true);
+motor SlidesMotorB = motor(PORT5, ratio18_1, false);
+motor_group Slides = motor_group(SlidesMotorA, SlidesMotorB);
+
+motor IntakesMotorA = motor(PORT3, ratio18_1, false);
+motor IntakesMotorB = motor(PORT6, ratio18_1, true);
+motor_group Intakes = motor_group(IntakesMotorA, IntakesMotorB);
+
+motor LF = motor(PORT8, ratio18_1, false);
+
+motor RF = motor(PORT7, ratio18_1, true);
+
+motor LB = motor(PORT9, ratio18_1, false);
+
+motor RB = motor(PORT10, ratio18_1, true);
+
+
+
+// generating and setting random seed
+void initializeRandomSeed(){
+  int systemTime = Brain.Timer.systemHighResolution();
+  double batteryCurrent = Brain.Battery.current();
+  double batteryVoltage = Brain.Battery.voltage(voltageUnits::mV);
+
+  // Combine these values into a single integer
+  int seed = int(batteryVoltage + batteryCurrent * 100) + systemTime;
+
+  // Set the seed
+  srand(seed);
+}
+
+
+
+void vexcodeInit() {
+
+  //Initializing random seed.
+  initializeRandomSeed(); 
+}
+
+
+// Helper to make playing sounds from the V5 in VEXcode easier and
+// keeps the code cleaner by making it clear what is happening.
+void playVexcodeSound(const char *soundName) {
+  printf("VEXPlaySound:%s\n", soundName);
+  wait(5, msec);
+}
+
+
+
+// define variable for remote controller enable/disable
+bool RemoteControlCodeEnabled = true;
+
+#pragma endregion VEXcode Generated Robot Configuration
+
+
+controller con = controller(primary);
+#include "vex.h"
+#include <fstream>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <sstream>
+
+using namespace std;
+using namespace vex;
+
+//  TUNING VARIABLES
+
+// Forward/Back PD
+const double FWD_KP = 0.55;
+const double FWD_KD = 1.45;
+const double FWD_KI = 0.012;
+
+// Acceleration ramp
+const double RAMP_START_PCT = 15.0;   // speed to start at (%)
+const int    RAMP_DURATION_MS = 200;   // Acceleration period
+
+// Strafe PD
+const double STR_KP = 0.3;
+const double STR_KD = 0.5;
+const double STR_KI = 0.012;
+
+// Heading P
+const double HDG_KP = 2.5; 
+const double STR_HKP = 4;
+
+// General
+const double BASE_SPEED         = 50.0; 
+const double DRIVE_DONE_THRESH  = 8.0;  
+const double STRAFE_DETECT_THRESH = 15.0; // (LF+RB) - (RF+LB) = 15 = strafing
+const double VEL_ZERO_THRESH    = 3.0;
+const double MECH_VEL_THRESH    = 5.0;
+
+//  DATA STRUCTURES
+
+struct Frame {
+    int    timestamp;  // ms from recording start
+
+    double lfPos, rfPos, lbPos, rbPos;   // motor encoder positions (deg)
+    double lfVel, rfVel, lbVel, rbVel;   // recorded velocities (%)
+
+    double intakePos,   intakeVel;
+    double conveyorPos, conveyorVel;
+    double slidesPos,   slidesVel;
+
+    double heading;
+    int waypoint;   // 0=normal 1=drive_stop 2=mech_transition 3=both
+    int pauseMs;    // 0 normally, >0 = replay should pause this many ms after this segment's gap
+};
+
+// A waypoint segment: drive from frames[startIdx] to frames[endIdx], 
+// then spin mechanisms from frames[endIdx] onward until the next drive segment.
+struct Segment {
+    int driveStart;   // index into frames where drive move begins
+    int driveEnd;     // index where drivetrain reaches zero / mech starts
+    int mechEnd;      // index where mechanisms finish
+    int pauseMs;      // ms to pause in replay after this segment's gap (0 = skip)
+};
+
+//  CSV PARSER
+bool loadCSV(const char* path, vector<Frame>& frames) {
+    ifstream f(path);
+    if (!f.is_open()) return false;
+
+    string line;
+    getline(f, line);
+
+    while (getline(f, line)) {
+        if (line.empty()) continue;
+        Frame fr;
+        char dummy;   // for commas
+        istringstream ss(line);
+
+        // timestamp
+        ss >> fr.timestamp >> dummy;
+        // drivetrain positions
+        ss >> fr.lfPos >> dummy >> fr.rfPos >> dummy
+           >> fr.lbPos >> dummy >> fr.rbPos >> dummy;
+        // drivetrain velocities
+        ss >> fr.lfVel >> dummy >> fr.rfVel >> dummy
+           >> fr.lbVel >> dummy >> fr.rbVel >> dummy;
+        // intake
+        ss >> fr.intakePos >> dummy >> fr.intakeVel >> dummy;
+        // conveyor
+        ss >> fr.conveyorPos >> dummy >> fr.conveyorVel >> dummy;
+        // slides
+        ss >> fr.slidesPos >> dummy >> fr.slidesVel >> dummy;
+        // heading & waypoint & pause_ms
+        ss >> fr.heading >> dummy >> fr.waypoint >> dummy >> fr.pauseMs;
+
+        frames.push_back(fr);
+    }
+    return !frames.empty();
+}
+
+//  SEGMENT BUILDER
+// Walks the frame list and groups it into alternating drive/mech blocks.
+
+vector<Segment> buildSegments(const vector<Frame>& frames) {
+    vector<Segment> segs;
+    int n = (int)frames.size();
+    int i = 0;
+
+    while (i < n) {
+        Segment seg;
+        seg.driveStart = i;
+
+        // Find driveEnd
+        int driveEnd = n - 1;
+        for (int j = i + 1; j < n; j++) {
+            if (frames[j].waypoint & 1 || frames[j].waypoint & 2) {
+                driveEnd = j;
+                break;
+            }
+        }
+
+        seg.driveEnd = driveEnd;
+
+        // Find mechEnd
+        int mechEnd = driveEnd;
+        for (int j = driveEnd + 1; j < n; j++) {
+            bool driveMoving = fabs(frames[j].lfVel) > VEL_ZERO_THRESH ||
+                               fabs(frames[j].rfVel) > VEL_ZERO_THRESH ||
+                               fabs(frames[j].lbVel) > VEL_ZERO_THRESH ||
+                               fabs(frames[j].rbVel) > VEL_ZERO_THRESH;
+            if (driveMoving) {
+                mechEnd = j;
+                break;
+            }
+        }
+        seg.mechEnd = mechEnd;
+
+        // Scan the gap frames (driveEnd..mechEnd) for a marked pause
+        int segPauseMs = 0;
+        for (int j = seg.driveEnd; j <= seg.mechEnd; j++) {
+            if (frames[j].pauseMs > 0) {
+                segPauseMs = frames[j].pauseMs;
+                break;
+            }
+        }
+        seg.pauseMs = segPauseMs;
+
+        segs.push_back(seg);
+
+        // always advance by at least 1 to prevent infinite loop
+        int next = mechEnd + 1;
+        if (next <= i) next = i + 1;
+        i = next;
+    }
+    return segs;
+}
+
+//  MOTION HELPER
+
+// Detect whether a drive frame is primarily a strafe move.
+bool isStrafingFrame(const Frame& f) {
+    // Forward pair: LF+RF and LB+RB have same sign
+    // Strafe pair:  LF-RF and LB-RB have same sign, forward sum ≈ 0
+    double fwdComponent = fabs(f.lfVel + f.rfVel + f.lbVel + f.rbVel);
+    double strComponent = fabs(f.lfVel - f.rfVel - f.lbVel + f.rbVel);
+    return strComponent > fwdComponent + STRAFE_DETECT_THRESH;
+}
+
+// Clamp helper
+double clamp(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+//  DRIVE SEGMENT EXECUTOR
+// Drives from current position to the target positions in frames[endIdx]
+// using separate forward PID, strafe PID, and heading P.
+
+void executeDriveSegment(const vector<Frame>& frames, int startIdx, int endIdx) {
+    if (startIdx >= endIdx) return;
+
+    const Frame& target = frames[endIdx];
+
+    double lfBase = LF.position(degrees);
+    double rfBase = RF.position(degrees);
+    double lbBase = LB.position(degrees);
+    double rbBase = RB.position(degrees);
+
+    double lfTarget = target.lfPos - frames[startIdx].lfPos;
+    double rfTarget = target.rfPos - frames[startIdx].rfPos;
+    double lbTarget = target.lbPos - frames[startIdx].lbPos;
+    double rbTarget = target.rbPos - frames[startIdx].rbPos;
+
+    double headingTarget = target.heading;
+
+    int mid = (startIdx + endIdx) / 2;
+    bool strafing = isStrafingFrame(frames[mid]);
+
+    double kP = strafing ? STR_KP : FWD_KP;
+    double kD = strafing ? STR_KD : FWD_KD;
+    double kI = strafing ? STR_KI : FWD_KI;
+
+    double Hkp = strafing ? STR_HKP : HDG_KP;
+
+    double prevLF = 0, prevRF = 0, prevLB = 0, prevRB = 0;
+
+    double intLF = 0, intRF = 0, intLB = 0, intRB = 0;
+
+    // Ramp state
+    uint32_t segStart = Brain.Timer.time(msec);
+
+    while (true) {
+        double curLF = LF.position(degrees) - lfBase;
+        double curRF = RF.position(degrees) - rfBase;
+        double curLB = LB.position(degrees) - lbBase;
+        double curRB = RB.position(degrees) - rbBase;
+
+        double eLF = lfTarget - curLF;
+        double eRF = rfTarget - curRF;
+        double eLB = lbTarget - curLB;
+        double eRB = rbTarget - curRB;
+
+        intLF += eLF;
+        intRF += eRF;
+        intLB += eLB;
+        intRB += eRB;
+
+        const double INTEGRAL_LIMIT = 5000;
+
+        intLF = clamp(intLF, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+        intRF = clamp(intRF, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+        intLB = clamp(intLB, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+        intRB = clamp(intRB, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+
+        if (fabs(eLF) < DRIVE_DONE_THRESH && fabs(eRF) < DRIVE_DONE_THRESH &&
+            fabs(eLB) < DRIVE_DONE_THRESH && fabs(eRB) < DRIVE_DONE_THRESH) {
+            break;
+        }
+
+        double derivLF = eLF - prevLF;
+        double outLF = clamp(
+            (eLF * kP +
+            intLF * kI +
+            derivLF * kD)
+            * (BASE_SPEED / 100.0),
+            -100,
+            100
+        );
+        
+        double derivRF = eRF - prevRF;
+        double outRF = clamp(
+            (eRF * kP +
+            intRF * kI +
+            derivRF * kD)
+            * (BASE_SPEED / 100.0),
+            -100,
+            100
+        );
+        
+        double derivLB = eLB - prevLB;
+        double outLB = clamp(
+            (eLB * kP +
+            intLB * kI +
+            derivLB * kD)
+            * (BASE_SPEED / 100.0),
+            -100,
+            100
+        );
+        
+        double derivRB = eRB - prevRB; 
+        double outRB = clamp(
+            (eRB * kP +
+            intRB * kI +
+            derivRB * kD)
+            * (BASE_SPEED / 100.0),
+            -100,
+            100
+        );
+
+        double headingError = headingTarget - inertial1.rotation(deg);
+        double headingCorr  = headingError * Hkp;
+
+        outLF += headingCorr;
+        outRF -= headingCorr;
+        outLB += headingCorr;
+        outRB -= headingCorr;
+
+        // Acceleration ramp, scale outputs up from RAMP_START_PCT to 100%
+        int elapsed = (int)(Brain.Timer.time(msec) - segStart);
+        double rampScale = 1.0;
+        if (elapsed < RAMP_DURATION_MS) {
+            double t = (double)elapsed / RAMP_DURATION_MS;   // 0.0 → 1.0
+            rampScale = (RAMP_START_PCT + (100.0 - RAMP_START_PCT) * t) / 100.0;
+        }
+
+        LF.spin(vex::forward, clamp(outLF * rampScale, -100, 100), percent);
+        RF.spin(vex::forward, clamp(outRF * rampScale, -100, 100), percent);
+        LB.spin(vex::forward, clamp(outLB * rampScale, -100, 100), percent);
+        RB.spin(vex::forward, clamp(outRB * rampScale, -100, 100), percent);
+
+        prevLF = eLF; prevRF = eRF; prevLB = eLB; prevRB = eRB;
+
+        wait(20, msec);
+    }
+
+    LF.stop(brake); RF.stop(brake);
+    LB.stop(brake); RB.stop(brake);
+}
+
+//  MECHANISM SEGMENT EXECUTOR
+// Replays mechanism motion from frames[startIdx] to frames[endIdx].
+// Drivetrain is held stationary via heading P during this phase.
+
+void executeMechSegment(const vector<Frame>& frames, int startIdx, int endIdx) {
+    if (startIdx >= endIdx) return;
+
+    const Frame& mechTarget = frames[endIdx];
+    double holdHeading = inertial1.rotation(deg);
+
+    // Record positions at mech segment start to track relative travel
+    double intakeBase   = Intakes.position(degrees);
+    double conveyorBase = Conveyor.position(degrees);
+    double slidesBase   = Slides.position(degrees);
+
+    double intakeDelta   = mechTarget.intakePos   - frames[startIdx].intakePos;
+    double conveyorDelta = mechTarget.conveyorPos - frames[startIdx].conveyorPos;
+    double slidesDelta   = mechTarget.slidesPos   - frames[startIdx].slidesPos;
+
+    bool intakeDone   = fabs(intakeDelta)   < 5.0;
+    bool conveyorDone = fabs(conveyorDelta) < 5.0;
+    bool slidesDone   = fabs(slidesDelta)   < 5.0;
+
+    // Walk through the recorded mechanism frames to get velocity at each step
+    // Advance through them at the real 20ms loop rate
+    int frameIdx = startIdx;
+
+    while (!(intakeDone && conveyorDone && slidesDone)) {
+        if (frameIdx < endIdx) frameIdx++;
+        const Frame& f = frames[frameIdx];
+
+        // Intake
+        if (!intakeDone) {
+            double traveled = fabs(Intakes.position(degrees) - intakeBase);
+            if (traveled >= fabs(intakeDelta) - 5.0) {
+                Intakes.stop(coast);
+                intakeDone = true;
+            } else {
+                double dir = intakeDelta > 0 ? 1.0 : -1.0;
+                double vel = fabs(f.intakeVel) < MECH_VEL_THRESH ? 0 : fabs(f.intakeVel);
+                if (vel > 0)
+                    Intakes.spin(vex::forward, dir * vel, percent);
+                else
+                    Intakes.stop(coast);
+            }
+        }
+
+        // Conveyor
+        if (!conveyorDone) {
+            double traveled = fabs(Conveyor.position(degrees) - conveyorBase);
+            if (traveled >= fabs(conveyorDelta) - 5.0) {
+                Conveyor.stop(coast);
+                conveyorDone = true;
+            } else {
+                double dir = conveyorDelta > 0 ? 1.0 : -1.0;
+                double vel = fabs(f.conveyorVel) < MECH_VEL_THRESH ? 0 : fabs(f.conveyorVel);
+                if (vel > 0)
+                    Conveyor.spin(vex::forward, dir * vel, percent);
+                else
+                    Conveyor.stop(coast);
+            }
+        }
+
+        // Slides
+        if (!slidesDone) {
+            double traveled = fabs(Slides.position(degrees) - slidesBase);
+            if (traveled >= fabs(slidesDelta) - 5.0) {
+                Slides.stop(hold);  // hold slides in place once done
+                slidesDone = true;
+            } else {
+                double dir = slidesDelta > 0 ? 1.0 : -1.0;
+                double vel = fabs(f.slidesVel) < MECH_VEL_THRESH ? 0 : fabs(f.slidesVel);
+                if (vel > 0)
+                    Slides.spin(vex::forward, dir * vel, percent);
+                else
+                    Slides.stop(hold);
+            }
+        }
+
+        // Hold heading with P loop while mechs run
+        double headingError = holdHeading - inertial1.rotation(deg);
+        double headingCorr  = headingError * HDG_KP;
+        double hCorr = clamp(headingCorr, -30, 30);
+        LF.spin(vex::forward,  hCorr, percent);
+        RF.spin(vex::forward, -hCorr, percent);
+        LB.spin(vex::forward,  hCorr, percent);
+        RB.spin(vex::forward, -hCorr, percent);
+
+        wait(20, msec);
+    }
+
+    LF.stop(brake); RF.stop(brake); LB.stop(brake); RB.stop(brake);
+    Intakes.stop(coast);
+    Conveyor.stop(coast);
+}
+
+//  COMBINED DRIVE+MECH: mechanism runs concurrently with drive
+//  drivetrain uses ONLY the recorded velocity, no PID.
+
+void executeDriveWithMech(const vector<Frame>& frames, int startIdx, int endIdx) {
+    if (startIdx >= endIdx) return;
+
+    for (int i = startIdx; i <= endIdx; i++) {
+       uint32_t loopStart = Brain.Timer.time(msec);
+        const Frame& f = frames[i];
+
+        // Drivetrain: pure recorded velocity, no PID
+        LF.spin(vex::forward, f.lfVel, percent);
+        RF.spin(vex::forward, f.rfVel, percent);
+        LB.spin(vex::forward, f.lbVel, percent);
+        RB.spin(vex::forward, f.rbVel, percent);
+
+        // Mechanisms at recorded velocity
+        double intakeDir   = f.intakeVel   >= 0 ? 1.0 : -1.0;
+        double conveyorDir = f.conveyorVel >= 0 ? 1.0 : -1.0;
+        double slidesDir   = f.slidesVel   >= 0 ? 1.0 : -1.0;
+
+        if (fabs(f.intakeVel) >= MECH_VEL_THRESH)
+            Intakes.spin(vex::forward, intakeDir * fabs(f.intakeVel), percent);
+        else
+            Intakes.stop(coast);
+
+        if (fabs(f.conveyorVel) >= MECH_VEL_THRESH)
+            Conveyor.spin(vex::forward, conveyorDir * fabs(f.conveyorVel), percent);
+        else
+            Conveyor.stop(coast);
+
+        if (fabs(f.slidesVel) >= MECH_VEL_THRESH)
+            Slides.spin(vex::forward, slidesDir * fabs(f.slidesVel), percent);
+        else
+            Slides.stop(hold);
+
+        int elapsed = (int)(Brain.Timer.time(msec) - loopStart);
+        int remaining = 20 - elapsed;
+        if (remaining > 0) wait(remaining, msec);
+    }
+}
+
+
+int main() {
+    inertial1.calibrate();
+    Brain.Screen.printAt(5, 30, "Calibrating...");
+    while (inertial1.isCalibrating()) wait(50, msec);
+
+    // Load CSV
+    vector<Frame> frames;
+    Brain.Screen.printAt(5, 30, "Loading CSV...  ");
+    if (!loadCSV("recording.csv", frames)) {
+        Brain.Screen.clearScreen(red);
+        Brain.Screen.printAt(5, 30, "FAILED: cannot open recording.csv");
+        return 1;
+    }
+
+    Brain.Screen.printAt(5, 30, "Loaded %d frames", (int)frames.size());
+
+    // Build segments
+    vector<Segment> segs = buildSegments(frames);
+    Brain.Screen.printAt(5, 50, "Segments: %d", (int)segs.size());
+
+    if (segs.empty()) {
+        Brain.Screen.clearScreen(red);
+        Brain.Screen.printAt(5, 30, "ERROR: No segments built!");
+        Brain.Screen.printAt(5, 50, "Check waypoint flags in CSV");
+        return 1;
+    }
+
+    // Wait for X button, then countdown on controller
+    con.Screen.clearScreen();
+    con.Screen.setCursor(1, 1);
+    con.Screen.print("Press [X] to Run");
+    Brain.Screen.printAt(5, 80, "Press [X] on controller to run");
+    while (!con.ButtonX.pressing()) wait(20, msec);
+    while (con.ButtonX.pressing()) wait(20, msec);  // wait for release to avoid double-trigger
+
+    // Countdown
+    for (int i = 5; i >= 1; i--) {
+        con.Screen.clearScreen();
+        con.Screen.setCursor(1, 1);
+        con.Screen.print("Running in: %d", i);
+        wait(1000, msec);
+    }
+    con.Screen.clearScreen();
+    con.Screen.setCursor(1, 1);
+    con.Screen.print("RUNNING...");
+    Brain.Screen.clearScreen();
+    Brain.Screen.printAt(5, 30, "RUNNING...");
+
+    // Reset encoders and heading at replay start
+    LF.resetPosition(); RF.resetPosition();
+    LB.resetPosition(); RB.resetPosition();
+    Intakes.resetPosition();
+    Conveyor.resetPosition();
+    Slides.resetPosition();
+    inertial1.resetRotation();
+
+    // Execute each segment
+    for (int s = 0; s < (int)segs.size(); s++) {
+        const Segment& seg = segs[s];
+
+        Brain.Screen.printAt(5, 50, "Seg %d/%d drive  ", s+1, (int)segs.size());
+
+         // Check if any mechanism is actively running during the drive portion.
+        bool mechActiveDuringDrive = false;
+        for (int f = seg.driveStart; f <= seg.driveEnd; f++) {
+            if (fabs(frames[f].intakeVel)   >= MECH_VEL_THRESH ||
+                fabs(frames[f].conveyorVel) >= MECH_VEL_THRESH ||
+                fabs(frames[f].slidesVel)   >= MECH_VEL_THRESH) {
+                mechActiveDuringDrive = true;
+                break;
+            }
+        }
+
+        if (mechActiveDuringDrive) {
+            // replay drivetrain at recorded velocity, no PID
+            executeDriveWithMech(frames, seg.driveStart, seg.driveEnd);
+        } else {
+            // PID to target positions as fast as possible
+            executeDriveSegment(frames, seg.driveStart, seg.driveEnd);
+        }
+
+        // Mechanism phase
+        if (seg.driveEnd < seg.mechEnd) {
+            Brain.Screen.printAt(5, 50, "Seg %d/%d mech   ", s+1, (int)segs.size());
+            executeMechSegment(frames, seg.driveEnd, seg.mechEnd);
+        }
+
+        if (s < (int)segs.size() - 1) {
+            LF.stop(brake); RF.stop(brake); LB.stop(brake); RB.stop(brake);
+            if (seg.pauseMs > 0) {
+                // Recorded pause: hold for the marked duration
+                Brain.Screen.printAt(5, 50, "Seg %d/%d PAUSE %dms", s+1, (int)segs.size(), seg.pauseMs);
+                con.Screen.clearScreen();
+                con.Screen.setCursor(1, 1);
+                con.Screen.print("Pause %dms", seg.pauseMs);
+                wait(seg.pauseMs, msec);
+            } else {
+              wait (1, seconds);
+            }
+        }
+    }
+
+    LF.stop(brake); RF.stop(brake); LB.stop(brake); RB.stop(brake);
+    Intakes.stop(coast); Conveyor.stop(coast); Slides.stop(hold);
+
+    con.Screen.clearScreen();
+    con.Screen.setCursor(1, 1);
+    con.Screen.print("MACRO COMPlETE");
+    con.rumble ("-");
+
+    Brain.Screen.printAt(5, 30, "Autonomous complete.");
+    return 0;
+}
