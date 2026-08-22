@@ -1,0 +1,340 @@
+#pragma region VEXcode Generated Robot Configuration
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <math.h>
+#include <string.h>
+#include "vex.h"
+#include <fstream>
+
+using namespace vex;
+
+brain Brain;
+
+
+// START V5 MACROS
+#define waitUntil(condition)                                                   \
+  do {                                                                         \
+    wait(5, msec);                                                             \
+  } while (!(condition))
+
+#define repeat(iterations)                                                     \
+  for (int iterator = 0; iterator < iterations; iterator++)
+// END V5 MACROS
+
+
+// Robot configuration code.
+controller Controller1 = controller(primary);
+inertial inertial1 = inertial(PORT11);
+
+motor ConveyorMotorA = motor(PORT2, ratio18_1, false);
+motor ConveyorMotorB = motor(PORT12, ratio18_1, true);
+motor_group Conveyor = motor_group(ConveyorMotorA, ConveyorMotorB);
+
+motor SlidesMotorA = motor(PORT4, ratio18_1, true);
+motor SlidesMotorB = motor(PORT5, ratio18_1, false);
+motor_group Slides = motor_group(SlidesMotorA, SlidesMotorB);
+
+motor IntakesMotorA = motor(PORT3, ratio18_1, false);
+motor IntakesMotorB = motor(PORT6, ratio18_1, true);
+motor_group Intakes = motor_group(IntakesMotorA, IntakesMotorB);
+
+motor LF = motor(PORT8, ratio18_1, false);
+
+motor RF = motor(PORT7, ratio18_1, true);
+
+motor LB = motor(PORT9, ratio18_1, false);
+
+motor RB = motor(PORT10, ratio18_1, true);
+
+
+
+// generating and setting random seed
+void initializeRandomSeed(){
+  int systemTime = Brain.Timer.systemHighResolution();
+  double batteryCurrent = Brain.Battery.current();
+  double batteryVoltage = Brain.Battery.voltage(voltageUnits::mV);
+
+  // Combine these values into a single integer
+  int seed = int(batteryVoltage + batteryCurrent * 100) + systemTime;
+
+  // Set the seed
+  srand(seed);
+}
+
+
+
+void vexcodeInit() {
+
+  //Initializing random seed.
+  initializeRandomSeed(); 
+}
+
+
+// Helper to make playing sounds from the V5 in VEXcode easier and
+// keeps the code cleaner by making it clear what is happening.
+void playVexcodeSound(const char *soundName) {
+  printf("VEXPlaySound:%s\n", soundName);
+  wait(5, msec);
+}
+
+
+
+// define variable for remote controller enable/disable
+bool RemoteControlCodeEnabled = true;
+
+#pragma endregion VEXcode Generated Robot Configuration
+
+
+using namespace std;
+using namespace vex;
+
+// Global Objects
+controller con = controller(primary);
+
+bool isRecording = false;
+bool keepProgramRunning = true;
+int startTime;
+
+// WAYPOINT THRESHOLDS
+const double VEL_ZERO_THRESH  = 3.0;
+const double MECH_START_THRESH = 5.0;
+
+// LIMIT FUNCTION
+double lim(double val) {
+    if (val > 100.0) return 100.0;
+    if (val < -100.0) return -100.0;
+    return val;
+}
+
+void startRecording() {
+    // Reset all encoders
+    LF.resetPosition(); RF.resetPosition();
+    LB.resetPosition(); RB.resetPosition();
+    Intakes.resetPosition();
+    Conveyor.resetPosition();
+    Slides.resetPosition();
+    inertial1.resetRotation();
+
+    isRecording = true;
+    startTime = Brain.Timer.time(msec);
+    con.rumble("-");
+    con.Screen.clearScreen();
+    con.Screen.setCursor(1, 1);
+    con.Screen.print("Press [B] to Save");
+}
+
+void stopRecording() {
+    isRecording = false;
+    keepProgramRunning = false;
+}
+
+// MAIN RECORDING PROGRAM
+int main() {
+    inertial1.calibrate();
+    while (inertial1.isCalibrating()) { wait(100, msec); }
+
+    // SD Card Connection Check
+    std::ofstream sdFile("recording.csv");
+
+    if (!sdFile.is_open()) {
+        Brain.Screen.clearScreen(red);
+        Brain.Screen.setCursor(1, 1);
+        Brain.Screen.print("NO SD CARD DETECTED!");
+        con.Screen.print("SD ERROR!");
+        con.rumble("---");
+    } else {
+        // Write CSV header
+        sdFile << "timestamp_ms,"
+               << "LF_pos,RF_pos,LB_pos,RB_pos,"
+               << "LF_vel,RF_vel,LB_vel,RB_vel,"
+               << "Intake_pos,Intake_vel,"
+               << "Conveyor_pos,Conveyor_vel,"
+               << "Slides_pos,Slides_vel,"
+               << "heading,"
+               << "waypoint,"
+               << "pause_ms\n";
+               // waypoint flag: 0=normal, 1=drive stopped, 2=mech transition, 3=both
+               // pause_ms 0 normally, set to pause duration when Up is pressed during a full-stop pause
+
+        con.Screen.clearScreen();
+        con.Screen.setCursor(1, 1);
+        con.Screen.print("SD Card: READY");
+        con.Screen.newLine();
+        con.Screen.print("Press [X] to Start");
+    }
+
+    con.ButtonX.pressed(startRecording);
+    con.ButtonB.pressed(stopRecording);
+
+    // Gyro Lock Tuning
+    double kP_gyroLock = 4;
+    bool isStrafingLastFrame = false;
+    double lockHeading = 0.0;
+
+    // Previous frame mechanism velocities for waypoint transition detection
+    double prevIntakeVel   = 0.0;
+    double prevConveyorVel = 0.0;
+    double prevSlidesVel   = 0.0;
+
+    // Pause marking
+    // Tracks how long the robot has been fully still during recording.
+    // When Up is pressed during a still-pause, stamp pause_ms on that frame.
+    bool   inStillPause    = false;  // true while everything is at zero
+    int    stillPauseStart = 0;      // timestamp (ms) when the pause began
+    bool   pauseMarked     = false;  // check if already marked
+    int    pendingPauseMs  = 0;      // nonzero for exactly one frame after Up press
+
+    while (keepProgramRunning) {
+        uint32_t loopStart = Brain.Timer.time(msec);
+        // DRIVER CONTROL
+        int forw    = con.Axis3.position();
+        int lateral = con.Axis4.position();
+        int tur     = con.Axis1.position();
+
+        double currentHeading = inertial1.rotation(deg);
+        double gyroCorrection = 0;
+
+        // LIVE GYRO LOCK DURING RECORDING
+        
+        if (abs(lateral) > 5 && abs(tur) < 5) {
+            if (!isStrafingLastFrame) {
+                lockHeading = currentHeading;
+                isStrafingLastFrame = true;
+            }
+            double gyroError = lockHeading - currentHeading;
+            gyroCorrection = gyroError * kP_gyroLock;
+        } else {
+            isStrafingLastFrame = false;
+        }
+
+        double finalTurn = tur + gyroCorrection;
+
+        // Drive Output Execution
+        LF.spin(vex::forward, lim(forw + lateral + finalTurn), percent);
+        RF.spin(vex::forward, lim(forw - lateral - finalTurn), percent);
+        LB.spin(vex::forward, lim(forw - lateral + finalTurn), percent);
+        RB.spin(vex::forward, lim(forw + lateral - finalTurn), percent);
+
+        // Subsystems
+        Slides.setStopping(hold);
+        if (con.ButtonUp.pressing())        Conveyor.spin(vex::forward, 50, percent);
+        else if (con.ButtonDown.pressing()) Conveyor.spin(vex::reverse, 50, percent);
+        else                                Conveyor.stop();
+
+        if (con.ButtonL1.pressing())        Slides.spin(vex::forward, 50, percent);
+        else if (con.ButtonL2.pressing())   Slides.spin(vex::reverse, 50, percent);
+        else                                Slides.stop();
+
+        if (con.ButtonR1.pressing())        Intakes.spin(vex::forward, 20, percent);
+        else if (con.ButtonR2.pressing())   Intakes.spin(vex::reverse, 20, percent);
+        else                                Intakes.stop();
+
+        // RECORDING
+        if (isRecording && sdFile.is_open()) {
+            int timestamp = Brain.Timer.time(msec) - startTime;
+
+            // Sample all motor state this frame
+            double lfVel       = LF.velocity(percent);
+            double rfVel       = RF.velocity(percent);
+            double lbVel       = LB.velocity(percent);
+            double rbVel       = RB.velocity(percent);
+
+            double intakeVel   = Intakes.velocity(percent);
+            double conveyorVel = Conveyor.velocity(percent);
+            double slidesVel   = Slides.velocity(percent);
+
+            // Waypoint detection
+            // Bit 0: drivetrain stopped this frame
+            bool driveStop = fabs(lfVel) < VEL_ZERO_THRESH &&
+                             fabs(rfVel) < VEL_ZERO_THRESH &&
+                             fabs(lbVel) < VEL_ZERO_THRESH &&
+                             fabs(rbVel) < VEL_ZERO_THRESH;
+
+            // Bit 1: any mechanism just crossed from stopped to spinning
+            auto crossed = [](double prev, double curr) {
+                return fabs(prev) < MECH_START_THRESH && fabs(curr) >= MECH_START_THRESH;
+            };
+            bool mechTransition = crossed(prevIntakeVel,   intakeVel)   ||
+                                  crossed(prevConveyorVel, conveyorVel) ||
+                                  crossed(prevSlidesVel,   slidesVel);
+
+            int waypoint = (driveStop ? 1 : 0) | (mechTransition ? 2 : 0);
+
+            // Pause marking
+
+            // Means drivetrain AND all mechanisms are idle.
+            bool fullyStill = driveStop &&
+                              fabs(intakeVel)   < MECH_START_THRESH &&
+                              fabs(conveyorVel) < MECH_START_THRESH &&
+                              fabs(slidesVel)   < MECH_START_THRESH;
+
+            pendingPauseMs = 0; // reset each frame, set below if Up pressed
+
+            if (fullyStill) {
+                if (!inStillPause) {
+                    // Just entered a still pause
+                    inStillPause    = true;
+                    stillPauseStart = timestamp;
+                    pauseMarked     = false;
+                    con.Screen.clearLine(2);
+                    con.Screen.setCursor(2, 1);
+                    con.Screen.print("PAUSED:[RIGHT]=mark");
+                }
+                // Up marks the pause duration on this frame
+                if (con.ButtonRight.pressing() && !pauseMarked) {
+                    pendingPauseMs = timestamp - stillPauseStart;
+                    pauseMarked    = true;
+                    con.rumble(".");
+                    con.Screen.clearScreen();
+                    con.Screen.setCursor(1, 1);
+                    con.Screen.print("Pause marked: %dms", pendingPauseMs);
+                }
+            } else {
+                if (inStillPause) {
+                    // Robot started moving again, reset pause state
+                    inStillPause = false;
+                    pauseMarked  = false;
+                    con.Screen.clearScreen();
+                    con.Screen.setCursor(1, 1);
+                    con.Screen.print("Press [B] to Save");
+                }
+            }
+
+            // Write row
+            sdFile << timestamp                      << ","
+                   << LF.position(degrees)           << "," << RF.position(degrees) << ","
+                   << LB.position(degrees)           << "," << RB.position(degrees) << ","
+                   << lfVel                          << "," << rfVel << ","
+                   << lbVel                          << "," << rbVel << ","
+                   << Intakes.position(degrees)      << "," << intakeVel   << ","
+                   << Conveyor.position(degrees)     << "," << conveyorVel << ","
+                   << Slides.position(degrees)       << "," << slidesVel   << ","
+                   << currentHeading                 << ","
+                   << waypoint                       << ","
+                   << pendingPauseMs                 << "\n";
+
+            // Flush every ~0.5s to prevent crash
+            if (timestamp % 500 < 20) sdFile.flush();
+        }
+
+        // Update previous velocity trackers
+        prevIntakeVel   = Intakes.velocity(percent);
+        prevConveyorVel = Conveyor.velocity(percent);
+        prevSlidesVel   = Slides.velocity(percent);
+
+         int elapsed = (int)(Brain.Timer.time(msec) - loopStart);
+        int remaining = 20 - elapsed;
+        if (remaining > 0) wait(remaining, msec);
+    }
+
+    sdFile.close();
+    con.Screen.clearScreen();
+    con.Screen.setCursor(1, 1);
+    con.Screen.print("FILE SAVED");
+
+    LF.stop(brake); RF.stop(brake); LB.stop(brake); RB.stop(brake);
+
+    Brain.programStop();
+    return 0;
+}
