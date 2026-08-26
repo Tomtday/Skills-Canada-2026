@@ -1,0 +1,373 @@
+#pragma region VEXcode Generated Robot Configuration
+// Make sure all required headers are included.
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <math.h>
+#include <string.h>
+#include "vex.h"
+#include <cmath>
+
+using namespace vex;
+
+// Brain should be defined by default
+brain Brain;
+
+
+// START V5 MACROS
+#define waitUntil(condition)                                                   \
+  do {                                                                         \
+    wait(5, msec);                                                             \
+  } while (!(condition))
+
+#define repeat(iterations)                                                     \
+  for (int iterator = 0; iterator < iterations; iterator++)
+// END V5 MACROS
+
+
+// Robot configuration code.
+controller Controller1 = controller(primary);
+motor FrontRight = motor(PORT1, ratio18_1, true);
+
+motor FrontLeft = motor(PORT2, ratio18_1, false);
+
+motor BackRight = motor(PORT3, ratio18_1, true);
+
+motor BackLeft = motor(PORT12, ratio18_1, false);
+
+motor fuseCenter = motor(PORT4, ratio18_1, true);
+
+motor board_arm = motor(PORT13, ratio36_1, false);
+
+motor clawLift = motor(PORT18, ratio18_1, true);
+
+motor ArmMotor = motor(PORT5, ratio36_1, false);
+
+motor board_sliderMotorA = motor(PORT10, ratio18_1, true);
+motor board_sliderMotorB = motor(PORT20, ratio18_1, false);
+motor_group board_slider = motor_group(board_sliderMotorA, board_sliderMotorB);
+
+motor boardGripMotorA = motor(PORT19, ratio18_1, true);
+motor boardGripMotorB = motor(PORT9, ratio18_1, false);
+motor_group boardGrip = motor_group(boardGripMotorA, boardGripMotorB);
+
+motor fuseLeft = motor(PORT6, ratio18_1, true);
+
+motor fuseRight = motor(PORT16, ratio18_1, false);
+
+motor wheelSlide = motor(PORT15, ratio18_1, false);
+
+motor wheel = motor(PORT14, ratio18_1, false);
+
+motor deathDestroyer9000MotorA = motor(PORT17, ratio18_1, false);
+motor deathDestroyer9000MotorB = motor(PORT7, ratio18_1, true);
+motor_group deathDestroyer9000 = motor_group(deathDestroyer9000MotorA, deathDestroyer9000MotorB);
+
+motor ElbowMotor = motor(PORT8, ratio18_1, false);
+
+motor29 clawElbow = motor29(Brain.ThreeWirePort.A, false);
+motor29 clawWrist = motor29(Brain.ThreeWirePort.B, true);
+motor29 claw = motor29(Brain.ThreeWirePort.C, false);
+
+
+// generating and setting random seed
+void initializeRandomSeed(){
+  int systemTime = Brain.Timer.systemHighResolution();
+  double batteryCurrent = Brain.Battery.current();
+  double batteryVoltage = Brain.Battery.voltage(voltageUnits::mV);
+
+  // Combine these values into a single integer
+  int seed = int(batteryVoltage + batteryCurrent * 100) + systemTime;
+
+  // Set the seed
+  srand(seed);
+}
+
+
+
+void vexcodeInit() {
+
+  //Initializing random seed.
+  initializeRandomSeed(); 
+}
+
+
+// Helper to make playing sounds from the V5 in VEXcode easier and
+// keeps the code cleaner by making it clear what is happening.
+void playVexcodeSound(const char *soundName) {
+  printf("VEXPlaySound:%s\n", soundName);
+  wait(5, msec);
+}
+
+
+
+// define variable for remote controller enable/disable
+bool RemoteControlCodeEnabled = true;
+
+#pragma endregion VEXcode Generated Robot Configuration
+
+bool sliderConverging = false;
+bool convergeLatch = false;
+
+// Mode State
+
+enum ControlMode {
+  ARM_MODE,
+  ECU_MODE,
+  CLAW_AND_WHEEL
+};
+
+ControlMode currentMode = ARM_MODE;
+
+// Helper Functions
+
+double applyDeadzone(double x, double deadzone) {
+  if (fabs(x) < deadzone) return 0;
+  return x;
+}
+
+double expoCurve(double x, double k) {
+  double magnitude = fabs(x);
+  double output = 100.0 * ((exp(k * magnitude / 100.0) - 1.0) / (exp(k) - 1.0));
+  return (x < 0) ? -output : output;
+}
+
+void setV5Hold() {
+  FrontLeft.setStopping(hold);
+  FrontRight.setStopping(hold);
+  BackLeft.setStopping(hold);
+  BackRight.setStopping(hold);
+
+  ArmMotor.setStopping(hold);
+  ElbowMotor.setStopping(hold);
+  board_arm.setStopping(hold);
+  deathDestroyer9000.setStopping(hold);
+  boardGrip.setStopping(hold);
+
+  boardGrip.setMaxTorque(40, percent);
+
+  fuseLeft.setStopping(hold);
+  fuseRight.setStopping(hold);
+  fuseCenter.setStopping(hold);
+
+  fuseLeft.setMaxTorque(29, percent);
+  fuseRight.setMaxTorque(29, percent);
+  fuseCenter.setMaxTorque(29, percent);
+
+  fuseLeft.setVelocity(50, percent);
+  fuseCenter.setVelocity(50, percent);
+  fuseRight.setVelocity(50, percent);
+
+  clawLift.setStopping(hold);
+}
+
+void printMode() {
+  Controller1.Screen.clearLine(1);
+  Controller1.Screen.setCursor(1, 1);
+  if (currentMode == ARM_MODE) Controller1.Screen.print("Mode: FUSE");
+  else if (currentMode == ECU_MODE) Controller1.Screen.print("Mode: CIRCUIT BOARDS");
+  else if (currentMode == CLAW_AND_WHEEL) Controller1.Screen.print("Mode: CLAW/BEAM");
+}
+
+// Main
+
+int main() {
+  vexcodeInit();
+  setV5Hold();
+
+  bool fuse = false;
+
+  const double k = 4.0;
+  const double DRIVE_DEADZONE = 5.0;
+  const int MOVE_SPEED = 50;
+
+  bool toggleLatch = false;
+  printMode();
+
+  while (true) {
+    // Mode Toggle
+    if (Controller1.ButtonL1.pressing() && Controller1.ButtonR1.pressing() && !toggleLatch) {
+      toggleLatch = true;
+      
+      // Rotation through all 3 modes
+      if (currentMode == ARM_MODE) {
+        currentMode = ECU_MODE;
+        ArmMotor.stop();
+        ElbowMotor.stop();
+      } 
+      else if (currentMode == ECU_MODE) {
+        currentMode = CLAW_AND_WHEEL;
+        board_arm.stop();
+        board_slider.stop ();
+        ArmMotor.stop();
+      } 
+      else {
+        currentMode = ARM_MODE;
+        clawLift.stop ();
+        wheelSlide.stop ();
+        wheel.stop ();
+      }
+      
+      printMode();
+    }
+
+    // latch prevent cycling
+    if (!Controller1.ButtonL1.pressing() || !Controller1.ButtonR1.pressing()) {
+      toggleLatch = false;
+    }
+
+    // raw inputs
+    double rawForward = applyDeadzone(Controller1.Axis3.position(), DRIVE_DEADZONE);
+    double rawStrafe  = applyDeadzone(Controller1.Axis4.position(), DRIVE_DEADZONE);
+    double rawRotate  = applyDeadzone(Controller1.Axis1.position(), DRIVE_DEADZONE);
+
+    // MODE: ARM_MODE
+    if (currentMode == ARM_MODE) {
+      double forw = expoCurve(rawForward, k);
+      double strafe = expoCurve(rawStrafe, k);
+      double rotate = expoCurve(rawRotate, k) *-1;
+
+      FrontLeft.spin(forward,  forw + strafe - rotate, percent);
+      BackLeft.spin(forward,   forw - strafe - rotate, percent);
+      FrontRight.spin(forward, forw - strafe + rotate, percent);
+      BackRight.spin(forward,  forw + strafe + rotate, percent);
+
+      // Arm logic
+      ArmMotor.spin(forward, Controller1.ButtonL1.pressing() ? 30 : (Controller1.ButtonL2.pressing() ? -30 : 0), percent);
+      ElbowMotor.spin(forward, Controller1.ButtonR1.pressing() ? 25 : (Controller1.ButtonR2.pressing() ? -25 : 0), percent);
+      
+      if (Controller1.ButtonRight.pressing()) {
+        fuse = true;
+      }
+      else if (Controller1.ButtonLeft.pressing()) {
+        fuseLeft.spin(reverse);
+        fuseCenter.spin (reverse);
+        fuseRight.spin(reverse);
+        fuse = false;
+      }
+
+      if (fuse){
+        fuseLeft.spin(forward);
+        fuseCenter.spin (forward);
+        fuseRight.spin(forward);
+      } else if (!fuse && !Controller1.ButtonLeft.pressing ()){
+        fuseLeft.stop();
+        fuseCenter.stop ();
+        fuseRight.stop();
+      }
+      //deathDestroyer9000 = motors to spin out fuse holders
+      deathDestroyer9000.spin(forward, Controller1.ButtonY.pressing() ? 25 : (Controller1.ButtonA.pressing() ? -25 : 0), percent);
+    }
+
+    // MODE: ECU_MODE
+    else if (currentMode == ECU_MODE) {
+      // Drivetrain reversed
+      double forw = expoCurve(rawForward, k) * -1;
+      double strafe = expoCurve(rawStrafe, k) * -1;
+      double rotate = expoCurve(rawRotate, k) *-1;
+
+      FrontLeft.spin(forward,  forw + strafe - rotate, percent);
+      BackLeft.spin(forward,   forw - strafe - rotate, percent);
+      FrontRight.spin(forward, forw - strafe + rotate, percent);
+      BackRight.spin(forward,  forw + strafe + rotate, percent);
+      
+      if (fuse){
+        fuseLeft.spin(forward, 50, percent);
+        fuseCenter.spin (forward, 50, percent);
+        fuseRight.spin(forward, 50, percent);
+      } else if (!fuse && !Controller1.ButtonLeft.pressing ()){
+        fuseLeft.stop();
+        fuseCenter.stop ();
+        fuseRight.stop();
+      }
+
+      ArmMotor.spin(forward, Controller1.ButtonL1.pressing() ? 30 : (Controller1.ButtonL2.pressing() ? -30 : 0), percent);
+      board_arm.spin(forward, Controller1.ButtonR1.pressing() ? MOVE_SPEED : (Controller1.ButtonR2.pressing() ? -MOVE_SPEED : 0), percent);
+
+      bool sliderInterruptPressed = Controller1.ButtonRight.pressing()
+                           || Controller1.ButtonLeft.pressing()
+                           || Controller1.ButtonY.pressing()
+                           || Controller1.ButtonA.pressing();
+
+// Activate convergence
+if (Controller1.ButtonX.pressing() && Controller1.ButtonUp.pressing() && !convergeLatch) {
+  sliderConverging = true;
+  convergeLatch = true;
+}
+
+// Cancel convergence if any slider button is pressed
+if (sliderInterruptPressed) {
+  sliderConverging = false;
+}
+
+// Release latch
+if (!Controller1.ButtonX.pressing() || !Controller1.ButtonUp.pressing()) {
+  convergeLatch = false;
+}
+
+// Converge: run both motors inward
+if (sliderConverging) {
+  board_sliderMotorA.spin(forward, -MOVE_SPEED, percent);
+  board_sliderMotorB.spin(forward, -MOVE_SPEED, percent);
+}
+// Normal individual slider control
+else {
+  board_sliderMotorA.spin(forward,
+    Controller1.ButtonRight.pressing() ? -MOVE_SPEED :
+    (Controller1.ButtonLeft.pressing() ?  MOVE_SPEED : 0), percent);
+
+  board_sliderMotorB.spin(forward,
+    Controller1.ButtonY.pressing() ? -MOVE_SPEED :
+    (Controller1.ButtonA.pressing() ?  MOVE_SPEED : 0), percent);
+}
+
+// Gripper controls
+if (Controller1.ButtonX.pressing() && !Controller1.ButtonUp.pressing())
+  boardGripMotorA.spin(forward, MOVE_SPEED, percent);
+else if (Controller1.ButtonB.pressing())
+  boardGripMotorA.spin(reverse, MOVE_SPEED, percent);
+else if (boardGripMotorA.direction() == reverse)
+  boardGripMotorA.stop();
+
+if (Controller1.ButtonUp.pressing() && !Controller1.ButtonX.pressing())
+  boardGripMotorB.spin(forward, MOVE_SPEED, percent);
+else if (Controller1.ButtonDown.pressing())
+  boardGripMotorB.spin(reverse, MOVE_SPEED, percent);
+else if (boardGripMotorB.direction() == reverse)
+  boardGripMotorB.stop();
+    }
+    // MODE: CLAW_AND_WHEEL
+    else if (currentMode == CLAW_AND_WHEEL) {
+
+      double forw = expoCurve(rawForward, k);
+      double strafe = expoCurve(rawStrafe, k);
+      double rotate = expoCurve(rawRotate, k) *-1;
+
+      FrontLeft.spin(forward,  forw + strafe - rotate, percent);
+      BackLeft.spin(forward,   forw - strafe - rotate, percent);
+      FrontRight.spin(forward, forw - strafe + rotate, percent);
+      BackRight.spin(forward,  forw + strafe + rotate, percent);
+
+      if (fuse){
+        fuseLeft.spin(forward, 50, percent);
+        fuseCenter.spin (forward, 50, percent);
+        fuseRight.spin(forward, 50, percent);
+      } else if (!fuse && !Controller1.ButtonLeft.pressing ()){
+        fuseLeft.stop();
+        fuseCenter.stop ();
+        fuseRight.stop();
+      }
+
+    //mech controls
+    clawLift.spin(forward, Controller1.ButtonUp.pressing() ? 15 : (Controller1.ButtonDown.pressing() ? -15 : 0), percent);
+    wheelSlide.spin(forward, Controller1.ButtonL1.pressing() ? MOVE_SPEED : (Controller1.ButtonL2.pressing() ? -MOVE_SPEED : 0), percent);
+    claw.spin(forward, Controller1.ButtonX.pressing() ? 100 : (Controller1.ButtonB.pressing() ? -100 : 0), percent);
+    clawElbow.spin(forward, Controller1.ButtonY.pressing() ? MOVE_SPEED : (Controller1.ButtonA.pressing() ? -MOVE_SPEED : 0), percent);
+    clawWrist.spin(forward, Controller1.ButtonRight.pressing() ? 30 : (Controller1.ButtonLeft.pressing() ? -30 : 0), percent);
+    wheel.spin(forward, Controller1.ButtonR1.pressing() ? 100 : (Controller1.ButtonR2.pressing() ? -100 : 0), percent);
+    }
+
+    wait(20, msec);
+  }
+
+}
