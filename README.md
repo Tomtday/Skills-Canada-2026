@@ -16,7 +16,7 @@ While there are additional code and CAD files related to this project, this repo
 - Designed and programmed three competition robots
 - Developed autonomous systems using inertial sensors, PID control, and data logging
 - Created autonomous tuning software with SD card data storage
-- Contributed over 250 hours during an eight-month design cycle
+- Contributed over 250 hours during an eight-month design period
 
 ## Game Description
 
@@ -28,7 +28,7 @@ The 2026 Skills Canada Mobile Robotics challenge simulated a burning factory. Th
 - Replacing damaged components with functioning ones
 - Autonomously delivering supplies to safe zones for trapped workers
 
-For a complete description of the challenge, see **Mobile Robotics 2026 Game Description.pdf**.
+For a complete description of the challenge, see [Mobile Robotics 2026 Game Description](Mobile%20Robotics%202026%20Game%20Description.pdf).
 
 ## My Role
 
@@ -87,7 +87,7 @@ This component was designed to spin at high speed and remove fallen beams blocki
 
 This component was part of an early robot prototype. The original concept involved using a claw to pick up replacement fuses and insert them one at a time into the holder.
 
-However, the design was ultimately deemed too slow and was abandoned. A photo of the final mechanism can be found in **Photos/Final mech for inserting fuses.jpg**. The final version was not designed by me.
+However, the design was ultimately deemed too slow and was abandoned. A photo of the final mechanism can be found in [here](Photos/Final%20mech%20for%20inserting%20fuses.jpg). The final version was not designed by me.
 
 ---
 
@@ -138,4 +138,3 @@ Drive distances could be modified using controller buttons and saved to the SD c
 This code is similar to the tuning system but does not allow user interaction after autonomous mode has started and the fan position has been selected.
 
 This restriction was necessary to comply with competition rules during official autonomous runs.
-
